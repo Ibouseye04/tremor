@@ -2,6 +2,11 @@
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { MapContainer, TileLayer, CircleMarker, Tooltip } from 'react-leaflet';
+/* eslint-disable @typescript-eslint/no-explicit-any */
+const MC = MapContainer as any;
+const TL = TileLayer as any;
+const CM = CircleMarker as any;
+/* eslint-enable @typescript-eslint/no-explicit-any */
 import type { MarketMovement, MarketCategory } from '@/lib/types';
 import { GeographicService } from '@/lib/geographic-service';
 
@@ -158,7 +163,7 @@ function AnimatedCircleMarker({
   const weight = isGlobal || isFederal ? 2 : 1;
 
   return (
-    <CircleMarker
+    <CM
       key={d.id}
       center={[d.lat, d.lng]}
       radius={r}
@@ -173,7 +178,7 @@ function AnimatedCircleMarker({
       data-testid="marker"
     >
       <MarkerTooltip d={d} />
-    </CircleMarker>
+    </CM>
   );
 }
 
@@ -332,14 +337,14 @@ export function TremorMapView({
   }
 
   return (
-    <MapContainer
+    <MC
       key="tremor-map"
       center={center}
       zoom={4}
       preferCanvas={true}
       style={{ height: '100%', width: '100%' }}
     >
-      <TileLayer
+      <TL
         attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
         url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
       />
@@ -352,6 +357,6 @@ export function TremorMapView({
           isNew={isNewId(d.id)}
         />
       ))}
-    </MapContainer>
+    </MC>
   );
 }

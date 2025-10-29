@@ -1,86 +1,15 @@
 import { v } from 'convex/values';
-import { internalMutation, query } from './_generated/server';
+import { internalAction, internalMutation, query } from './_generated/server';
+import { api, internal } from './_generated/api';
 import { enrichGeoFromText } from './geo';
 
-// Compute baselines for a market (run nightly)
-export const computeBaselines = internalMutation({
-  args: {
-    conditionId: v.string(),
-    lookbackDays: v.optional(v.number()),
-  },
-  handler: async (ctx, args) => {
-    const lookbackDays = args.lookbackDays || 14;
-    const cutoff = Date.now() - lookbackDays * 24 * 60 * 60 * 1000;
+type SnapshotDoc = {
+  price01: number;
+  timestampMs: number;
+  volumeSince?: number;
+};
 
-    // Get price snapshots for the lookback period
-    const snapshots = await ctx.db
-      .query('priceSnapshots')
-      .withIndex('by_market_time', (q) =>
-        q.eq('conditionId', args.conditionId).gte('timestampMs', cutoff)
-      )
-      .collect();
-
-    if (snapshots.length < 10) {
-      // Not enough data for reliable baselines
-      return { error: 'Insufficient data' };
-    }
-
-    // Calculate price returns between consecutive snapshots
-    const returns: number[] = [];
-    const volumes: number[] = [];
-
-    for (let i = 1; i < snapshots.length; i++) {
-      const prev = snapshots[i - 1];
-      const curr = snapshots[i];
-
-      if (prev.price01 > 0) {
-        const ret = (curr.price01 - prev.price01) / prev.price01;
-        returns.push(ret);
-      }
-
-      volumes.push(curr.volumeSince || 0);
-    }
-
-    if (returns.length === 0) {
-      return { error: 'No valid returns' };
-    }
-
-    const p95TradeSize = 1000; // Default whale threshold
-
-    const meanRet1m = returns.reduce((a, b) => a + b, 0) / returns.length;
-    const stdRet1m = Math.sqrt(
-      returns.reduce((sum, r) => sum + Math.pow(r - meanRet1m, 2), 0) /
-        returns.length
-    );
-    const avgVol1m = volumes.reduce((a, b) => a + b, 0) / volumes.length;
-
-    // Upsert baseline
-    const existing = await ctx.db
-      .query('baselines')
-      .withIndex('by_condition', (q) => q.eq('conditionId', args.conditionId))
-      .first();
-
-    const baseline = {
-      conditionId: args.conditionId,
-      computedAt: Date.now(),
-      meanRet1m,
-      stdRet1m: stdRet1m || 0.001, // Avoid division by zero
-      p95TradeSize,
-      avgVol1m,
-      dayCount: lookbackDays,
-    };
-
-    if (existing) {
-      await ctx.db.patch(existing._id, baseline);
-    } else {
-      await ctx.db.insert('baselines', baseline);
-    }
-
-    return baseline;
-  },
-});
-
-// Compute Seismo score on read (no writes)
+// Compute Seismo score and persist to 'scores'
 export const computeEventScore = query({
   args: {
     eventId: v.string(),
@@ -94,38 +23,57 @@ export const computeEventScore = query({
     const markets = await ctx.db
       .query('markets')
       .withIndex('by_event', (q) => q.eq('eventId', args.eventId))
-      .query('markets')
-      .withIndex('by_event', (q) => q.eq('eventId', args.eventId))
       .collect();
 
-    if (markets.length === 0) {
-      return { error: 'No markets in event' };
-    }
+    if (markets.length === 0)
+      return { error: 'No markets found for this event.' };
 
-    // Get price snapshots for ALL markets in the event
-    const snapshots = await ctx.db
-      .query('priceSnapshots')
-      .withIndex('by_event_time', (q) =>
-        q.eq('eventId', args.eventId).gte('timestampMs', cutoff)
-      )
-      .collect();
+    const marketSnapshots = new Map<
+      string,
+      { start?: SnapshotDoc; end?: SnapshotDoc }
+    >();
 
-    if (snapshots.length < 2) {
-      return { error: 'Insufficient data' };
-    }
+    for (const m of markets) {
+      const endDoc = await ctx.db
+        .query('priceSnapshots')
+        .withIndex('by_market_time', (q) =>
+          q.eq('conditionId', m.conditionId).lte('timestampMs', now)
+        )
+        .order('desc')
+        .first();
+      const end = endDoc || undefined;
 
-    // Group snapshots by market to find the biggest mover
-    const marketSnapshots = new Map<string, typeof snapshots>();
-    for (const snapshot of snapshots) {
-      if (!marketSnapshots.has(snapshot.conditionId)) {
-        marketSnapshots.set(snapshot.conditionId, []);
+      const startBeforeDoc = await ctx.db
+        .query('priceSnapshots')
+        .withIndex('by_market_time', (q) =>
+          q.eq('conditionId', m.conditionId).lte('timestampMs', cutoff)
+        )
+        .order('desc')
+        .first();
+
+      const startAfterDoc = await ctx.db
+        .query('priceSnapshots')
+        .withIndex('by_market_time', (q) =>
+          q.eq('conditionId', m.conditionId).gte('timestampMs', cutoff)
+        )
+        .order('asc')
+        .first();
+
+      let start = startBeforeDoc || undefined;
+      if (
+        startAfterDoc &&
+        (!startBeforeDoc ||
+          Math.abs(startAfterDoc.timestampMs - cutoff) <
+            Math.abs(startBeforeDoc.timestampMs - cutoff))
+      ) {
+        start = startAfterDoc;
       }
 
       marketSnapshots.set(m.conditionId, { start, end });
     }
 
-    // Find the market with biggest price change AND track all movements
     let maxChange = 0;
+    let maxChangeAbs = 0;
     let topMarketId = '';
     let topMarketQuestion = '';
     let totalVolume = 0;
@@ -133,8 +81,10 @@ export const computeEventScore = query({
     let activeMarkets = 0;
     let topPrev: number | undefined = undefined;
     let topCurr: number | undefined = undefined;
+    let highestVolumeMarketId = '';
+    let highestVolumeMarketQuestion = '';
+    let highestVolumeMarketVolume = 0;
 
-    // Track ALL market movements
     const allMovements: Array<{
       conditionId: string;
       question: string;
@@ -144,52 +94,54 @@ export const computeEventScore = query({
       volume: number;
     }> = [];
 
-    for (const [conditionId, mSnapshots] of marketSnapshots) {
-      if (mSnapshots.length < 1) continue;
-      // Ensure chronological order
-      mSnapshots.sort((a, b) => a.timestampMs - b.timestampMs);
+    for (const [conditionId, pair] of marketSnapshots) {
+      const end = pair.end;
+      if (!end) continue;
+      const start = pair.start;
 
-      // Get first and last prices in window
-      const first = mSnapshots[0];
-      const last = mSnapshots[mSnapshots.length - 1];
-      const prev = first.price01;
-      const curr = last.price01;
+      const prev =
+        typeof start?.price01 === 'number' ? start.price01 : end.price01;
+      const curr = typeof end.price01 === 'number' ? end.price01 : prev;
+      if (!Number.isFinite(prev) || !Number.isFinite(curr)) continue;
 
-      // Calculate probability change in percentage points
-      // Also track if this is a reversal (more significant)
-      const absoluteChange = (curr - prev) * 100; // Signed change in pp
-      const absoluteChangeMagnitude = Math.abs(absoluteChange);
+      const signedChange = (curr - prev) * 100;
+      const absoluteChangeMagnitude = Math.abs(signedChange);
 
-      // Check if this is a reversal (crossing 0.5)
-      const _isReversal =
-        (prev < 0.5 && curr > 0.5) || (prev > 0.5 && curr < 0.5);
-
-      // Sum volume across all snapshots
-      const marketVolume = mSnapshots.reduce(
+      const vols = await ctx.db
+        .query('priceSnapshots')
+        .withIndex('by_market_time', (q) =>
+          q.eq('conditionId', conditionId).gte('timestampMs', cutoff)
+        )
+        .filter((q) => q.lte(q.field('timestampMs'), now))
+        .collect();
+      const marketVolume = vols.reduce(
         (sum, s) => sum + (s.volumeSince || 0),
         0
       );
       totalVolume += marketVolume;
-
       if (marketVolume > 0) activeMarkets++;
 
-      // Find the market info
       const market = markets.find((m) => m.conditionId === conditionId);
       const marketQuestion = market?.question || 'Unknown';
 
-      // Track ALL markets in the event (not just ones that moved)
       allMovements.push({
         conditionId,
         question: marketQuestion,
         prevPrice: prev,
         currPrice: curr,
-        change: signedChange, // Store signed change
+        change: signedChange,
         volume: marketVolume,
       });
 
-      // Track the biggest mover
-      if (absoluteChangeMagnitude > Math.abs(maxChange)) {
-        maxChange = absoluteChangeMagnitude; // Keep unsigned for scoring
+      if (marketVolume > highestVolumeMarketVolume) {
+        highestVolumeMarketId = conditionId;
+        highestVolumeMarketQuestion = marketQuestion;
+        highestVolumeMarketVolume = marketVolume;
+      }
+
+      if (absoluteChangeMagnitude > maxChangeAbs) {
+        maxChangeAbs = absoluteChangeMagnitude;
+        maxChange = signedChange;
         topMarketId = conditionId;
         topMarketQuestion = marketQuestion;
         topMarketVolume = marketVolume;
@@ -198,57 +150,29 @@ export const computeEventScore = query({
       }
     }
 
-    // Persist event geo (best-effort): compute once when scoring and cache to eventGeo
-    try {
-      const eventDoc = await ctx.db
-        .query('events')
-        .withIndex('by_event', (q) => q.eq('eventId', args.eventId))
-        .first();
-      if (eventDoc) {
-        const existingGeo = await ctx.db
-          .query('eventGeo')
-          .withIndex('by_event', (q) => q.eq('eventId', args.eventId))
-          .first();
-
-        if (!existingGeo && topMarketQuestion) {
-          const enriched = enrichGeoFromText(
-            eventDoc.title || '',
-            topMarketQuestion
-          );
-          if (enriched) {
-            await ctx.db.insert('eventGeo', {
-              eventId: args.eventId,
-              lat: enriched.lat,
-              lng: enriched.lng,
-              region: enriched.region,
-              country: enriched.country,
-              geoConfidence: enriched.confidence,
-              derivedFrom: 'inferred',
-              updatedAt: Date.now(),
-            });
-          }
-        }
-      }
-    } catch {
-      // Best-effort: ignore enrichment persistence errors during scoring
-    }
-
-    // Sort movements by absolute change magnitude
     allMovements.sort((a, b) => Math.abs(b.change) - Math.abs(a.change));
 
-    // IMPROVED SCORING ALGORITHM
-    // Use logarithmic scale for more intuitive scores
-    // Also consider USD volume, not just shares
+    if (topMarketId === '' && highestVolumeMarketId !== '') {
+      topMarketId = highestVolumeMarketId;
+      topMarketQuestion = highestVolumeMarketQuestion;
+      topMarketVolume = highestVolumeMarketVolume;
+      const hvmMovement = allMovements.find(
+        (m) => m.conditionId === highestVolumeMarketId
+      );
+      if (hvmMovement) {
+        topPrev = hvmMovement.prevPrice;
+        topCurr = hvmMovement.currPrice;
+        maxChange = hvmMovement.change;
+        maxChangeAbs = Math.abs(hvmMovement.change);
+      }
+    }
 
-    // Convert share volume to approximate USD (assume avg price ~0.5)
-    const avgPrice = 0.5; // Could be improved with actual price data
-    const usdVolume = topMarketVolume * avgPrice;
+    const avgPrice = 0.5;
+    const usdVolume = totalVolume * avgPrice;
 
-    // Volume thresholds in USD
-    const minVolume = 1000; // $1k minimum for any score
-    const fullVolume = 10000; // $10k for full score
+    const minVolume = 1000;
+    const fullVolume = 10000;
 
-    // Volume multiplier (0 to 1)
     const volumeMultiplier =
       usdVolume < minVolume
         ? 0
@@ -257,44 +181,21 @@ export const computeEventScore = query({
             Math.sqrt((usdVolume - minVolume) / (fullVolume - minVolume))
           );
 
-    // Logarithmic scoring for price changes (more intuitive)
-    // 1pp = 1.0, 2pp = 2.5, 5pp = 5.0, 10pp = 7.5, 20pp+ = 10
     let baseScore: number;
-    const absChange = Math.abs(maxChange);
+    const absChange = maxChangeAbs;
 
-    if (absChange < 1) {
-      baseScore = absChange; // Linear for small changes
-    } else if (absChange < 5) {
-      baseScore = 1 + (absChange - 1) * 0.875; // Gradual increase
-    } else if (absChange < 10) {
-      baseScore = 4.5 + (absChange - 5) * 0.5; // Slower increase
-    } else if (absChange < 20) {
-      baseScore = 7 + (absChange - 10) * 0.3; // Asymptotic approach
-    } else {
-      baseScore = 10; // Max score
-    }
+    if (absChange < 1) baseScore = absChange;
+    else if (absChange < 5) baseScore = 1 + (absChange - 1) * 0.875;
+    else if (absChange < 10) baseScore = 4.5 + (absChange - 5) * 0.5;
+    else if (absChange < 20) baseScore = 7 + (absChange - 10) * 0.3;
+    else baseScore = 10;
 
     const seismoScore = Math.max(
       0,
       Math.min(10, Math.round(baseScore * volumeMultiplier * 10) / 10)
     );
 
-    // Store the score with ALL market movements
     const windowStr = `${args.windowMinutes}m`;
-    await ctx.db.insert('scores', {
-      eventId: args.eventId,
-      window: windowStr,
-      seismoScore,
-      topMarketId,
-      topMarketChange: maxChange, // Return signed change for display
-      topMarketQuestion,
-      topMarketPrevPrice01: topPrev,
-      topMarketCurrPrice01: topCurr,
-      marketMovements: allMovements,
-      totalVolume,
-      topMarketVolume,
-      activeMarkets,
-    });
 
     return {
       eventId: args.eventId,
@@ -302,6 +203,14 @@ export const computeEventScore = query({
       seismoScore,
       topMarketId,
       topMarketChange: maxChange,
+      topMarketQuestion,
+      topMarketPrevPrice01: topPrev,
+      topMarketCurrPrice01: topCurr,
+      marketMovements: allMovements,
+      totalVolume,
+      topMarketVolume,
+      activeMarkets,
+      timestampMs: now,
     };
   },
 });
@@ -319,18 +228,18 @@ export const backfillEventGeo = internalMutation({
     const limit = args.limit || 200;
     const cutoff = Date.now() - sinceHours * 60 * 60 * 1000;
 
-    // Get recent scores in the window
+    // Get recent scores in the window from scores_lite
     const scores = await ctx.db
-      .query('scores')
-      .withIndex('by_time_score', (q) => q.gte('timestampMs', cutoff))
-      .filter((q) => q.eq(q.field('window'), window))
+      .query('scores_lite')
+      .withIndex('by_window_score', (q) => q.eq('window', window))
+      .filter((q) => q.gte(q.field('updatedAt'), cutoff))
       .collect();
 
-    // Deduplicate by eventId keeping latest
+    // Map by event keeping latest updated
     const latestByEvent = new Map<string, (typeof scores)[0]>();
     for (const s of scores) {
       const existing = latestByEvent.get(s.eventId);
-      if (!existing || s.timestampMs > existing.timestampMs) {
+      if (!existing || s.updatedAt > existing.updatedAt) {
         latestByEvent.set(s.eventId, s);
       }
     }
@@ -394,90 +303,159 @@ export const getTopTremors = query({
   },
   handler: async (ctx, args) => {
     const window = args.window || '60m';
-    const window = args.window || '60m';
     const limit = args.limit || 20;
-    const cutoff = Date.now() - 5 * 60000; // Last 5 minutes of scores
 
-    // Get recent EVENT scores
-    const scores = await ctx.db
-      .query('scores')
-      .withIndex('by_time_score', (q) => q.gte('timestampMs', cutoff))
-      .filter((q) => q.eq(q.field('window'), window))
-      .collect();
+    // Read from materialized scores_lite
+    const items = await ctx.db
+      .query('scores_lite')
+      .withIndex('by_window_score', (q) => q.eq('window', window))
+      .order('desc')
+      .take(limit);
 
-    // Deduplicate by eventId - keep only the most recent score per event
-    const latestScores = new Map<string, (typeof scores)[0]>();
-    for (const score of scores) {
-      const existing = latestScores.get(score.eventId);
-      if (!existing || score.timestampMs > existing.timestampMs) {
-        latestScores.set(score.eventId, score);
-      }
-    }
-
-    // Sort by seismo score and take limit
-    const sortedScores = Array.from(latestScores.values())
-      .sort((a, b) => b.seismoScore - a.seismoScore)
-      .slice(0, limit);
-
-    // Join with event data
-    const results = await Promise.all(
-      sortedScores.map(async (score) => {
-        const event = await ctx.db
-          .query('events')
-          .withIndex('by_event', (q) => q.eq('eventId', score.eventId))
-          .first();
-
-        if (event) {
-          // Get the top market that moved
-          const topMarket = await ctx.db
+    const results: Array<Record<string, unknown>> = [];
+    for (const score of items) {
+      const event = await ctx.db
+        .query('events')
+        .withIndex('by_event', (q) => q.eq('eventId', score.eventId))
+        .first();
+      const topMarket = score.topMarketId
+        ? await ctx.db
             .query('markets')
             .withIndex('by_condition', (q) =>
-              q.eq('conditionId', score.topMarketId)
+              q.eq('conditionId', score.topMarketId!)
             )
-            .first();
+            .first()
+        : null;
 
-          // Server-side geo enrichment: prefer cached eventGeo, otherwise heuristic
-          let geo: {
-            lat: number;
-            lng: number;
-            region?: string;
-            country?: string;
-            confidence: string;
-          } | null = null;
-          const cached = await ctx.db
-            .query('eventGeo')
-            .withIndex('by_event', (q) => q.eq('eventId', score.eventId))
-            .first();
-          if (cached) {
-            geo = {
-              lat: cached.lat,
-              lng: cached.lng,
-              region: cached.region || undefined,
-              country: cached.country || undefined,
-              confidence: cached.geoConfidence,
-            };
-          } else {
-            const enriched = enrichGeoFromText(
-              event.title || '',
-              score.topMarketQuestion || topMarket?.question || ''
-            );
-            if (enriched) {
-              geo = enriched;
-            }
-          }
+      let geo: {
+        lat: number;
+        lng: number;
+        region?: string;
+        country?: string;
+        confidence: string;
+      } | null = null;
+      const cached = await ctx.db
+        .query('eventGeo')
+        .withIndex('by_event', (q) => q.eq('eventId', score.eventId))
+        .first();
+      if (cached) {
+        geo = {
+          lat: cached.lat,
+          lng: cached.lng,
+          region: cached.region || undefined,
+          country: cached.country || undefined,
+          confidence: cached.geoConfidence,
+        };
+      } else if (event) {
+        const enriched = enrichGeoFromText(
+          event.title || '',
+          score.topMarketQuestion || topMarket?.question || ''
+        );
+        if (enriched) geo = enriched;
+      }
 
-          return {
-            ...score,
-            event,
-            topMarket,
-            priceChange: score.topMarketChange,
-            geo: geo || undefined,
-          };
+      results.push({
+        ...score,
+        event,
+        topMarket,
+        priceChange: score.topMarketChange,
+        timestampMs: score.updatedAt,
+        geo: geo || undefined,
+      });
+    }
+
+    return results;
+  },
+});
+
+// Upsert a single scores_lite row
+export const upsertScoreLite = internalMutation({
+  args: {
+    eventId: v.string(),
+    window: v.string(),
+    seismoScore: v.number(),
+    topMarketId: v.optional(v.string()),
+    topMarketChange: v.optional(v.number()),
+    topMarketQuestion: v.optional(v.string()),
+    topMarketPrevPrice01: v.optional(v.float64()),
+    topMarketCurrPrice01: v.optional(v.float64()),
+    marketMovements: v.optional(
+      v.array(
+        v.object({
+          conditionId: v.string(),
+          question: v.string(),
+          prevPrice: v.float64(),
+          currPrice: v.float64(),
+          change: v.float64(),
+          volume: v.float64(),
+        })
+      )
+    ),
+    totalVolume: v.optional(v.float64()),
+    activeMarkets: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const existing = await ctx.db
+      .query('scores_lite')
+      .withIndex('by_event_window', (q) =>
+        q.eq('eventId', args.eventId).eq('window', args.window)
+      )
+      .first();
+
+    const doc = {
+      eventId: args.eventId,
+      window: args.window,
+      updatedAt: Date.now(),
+      seismoScore: args.seismoScore,
+      topMarketId: args.topMarketId,
+      topMarketChange: args.topMarketChange,
+      topMarketQuestion: args.topMarketQuestion,
+      topMarketPrevPrice01: args.topMarketPrevPrice01,
+      topMarketCurrPrice01: args.topMarketCurrPrice01,
+      marketMovements: args.marketMovements,
+      totalVolume: args.totalVolume,
+      activeMarkets: args.activeMarkets,
+    };
+
+    if (existing) {
+      await ctx.db.patch(existing._id, doc);
+    } else {
+      await ctx.db.insert('scores_lite', doc);
+    }
+  },
+});
+
+// Materialize scores into scores_lite for instant lists
+export const updateScoresLite = internalAction({
+  args: {},
+  handler: async (ctx) => {
+    const events = await ctx.runQuery(api.events.getActiveEvents, {
+      limit: 500,
+    });
+    const windows = [5, 60, 1440];
+
+    for (const event of events) {
+      for (const windowMinutes of windows) {
+        const scoreData = await ctx.runQuery(api.scoring.computeEventScore, {
+          eventId: event.eventId,
+          windowMinutes,
+        });
+        if (!('error' in scoreData)) {
+          await ctx.runMutation(internal.scoring.upsertScoreLite, {
+            eventId: event.eventId,
+            window: `${windowMinutes}m`,
+            seismoScore: scoreData.seismoScore,
+            topMarketId: scoreData.topMarketId,
+            topMarketChange: scoreData.topMarketChange,
+            topMarketQuestion: scoreData.topMarketQuestion,
+            topMarketPrevPrice01: scoreData.topMarketPrevPrice01,
+            topMarketCurrPrice01: scoreData.topMarketCurrPrice01,
+            marketMovements: scoreData.marketMovements,
+            totalVolume: scoreData.totalVolume,
+            activeMarkets: scoreData.activeMarkets,
+          });
         }
-        return null;
-      })
-    );
-
-    return results.filter((r) => r !== null);
+      }
+    }
   },
 });

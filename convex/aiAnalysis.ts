@@ -1,10 +1,12 @@
 import { v } from 'convex/values';
 import { mutation, query, action } from './_generated/server';
 import { api, internal } from './_generated/api';
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { logger } from '../lib/logger';
 
 // Public action to request AI analysis (called when user clicks Intelligence button)
-export const requestAnalysis = action({
+
+export const requestAnalysis: any = action({
   args: {
     movementId: v.string(),
     eventId: v.string(),
@@ -15,7 +17,7 @@ export const requestAnalysis = action({
     seismoScore: v.number(),
     marketQuestion: v.optional(v.string()),
   },
-  handler: async (ctx, args) => {
+  handler: async (ctx, args): Promise<unknown> => {
     // Check if score is high enough for AI analysis
     if (!args.seismoScore || args.seismoScore < 5) {
       return {
@@ -40,7 +42,8 @@ export const requestAnalysis = action({
 
     // Generate new analysis using the internal action
     const result = await ctx.runAction(
-      internal.aiActions.generateAnalysis,
+      (internal as unknown as { aiActions: { generateAnalysis: unknown } })
+        .aiActions.generateAnalysis as any,
       args
     );
 

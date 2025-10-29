@@ -1,6 +1,7 @@
 'use client';
 
 import { Header } from '@/components/header';
+import type { MarketMovement } from '@/lib/types';
 import { Sidebar } from '@/components/sidebar';
 import { TremorCard } from '@/components/tremor-card';
 import { TremorDetailPanel } from '@/components/tremor-detail-panel';
@@ -31,31 +32,33 @@ export default function Home() {
   }, [lastUpdateTime]);
 
   // Filter movements based on intensity and volume
-  const filteredMovements = movements.filter((m) => {
-    // Intensity filter
-    if (intensityFilter !== 'all') {
-      const score = m.seismoScore || 0;
-      if (intensityFilter === 'extreme' && score < 7.5) return false;
-      if (intensityFilter === 'high' && (score < 5 || score >= 7.5))
-        return false;
-      if (intensityFilter === 'moderate' && (score < 2.5 || score >= 5))
-        return false;
-      if (intensityFilter === 'low' && score >= 2.5) return false;
-    }
+  const filteredMovements: MarketMovement[] = movements.filter(
+    (m: MarketMovement) => {
+      // Intensity filter
+      if (intensityFilter !== 'all') {
+        const score = m.seismoScore || 0;
+        if (intensityFilter === 'extreme' && score < 7.5) return false;
+        if (intensityFilter === 'high' && (score < 5 || score >= 7.5))
+          return false;
+        if (intensityFilter === 'moderate' && (score < 2.5 || score >= 5))
+          return false;
+        if (intensityFilter === 'low' && score >= 2.5) return false;
+      }
 
-    // Volume filter
-    if (volumeFilter !== 'all') {
-      const volume = m.totalVolume || 0;
-      if (volumeFilter === 'whale' && volume < 500000) return false;
-      if (volumeFilter === 'high' && (volume < 100000 || volume >= 500000))
-        return false;
-      if (volumeFilter === 'medium' && (volume < 25000 || volume >= 100000))
-        return false;
-      if (volumeFilter === 'low' && volume >= 25000) return false;
-    }
+      // Volume filter
+      if (volumeFilter !== 'all') {
+        const volume = m.totalVolume || 0;
+        if (volumeFilter === 'whale' && volume < 500000) return false;
+        if (volumeFilter === 'high' && (volume < 100000 || volume >= 500000))
+          return false;
+        if (volumeFilter === 'medium' && (volume < 25000 || volume >= 100000))
+          return false;
+        if (volumeFilter === 'low' && volume >= 25000) return false;
+      }
 
-    return true;
-  });
+      return true;
+    }
+  );
 
   // Handle ESC key to close panel
   useEffect(() => {

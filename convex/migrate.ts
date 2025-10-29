@@ -24,8 +24,7 @@ export const migrateToNewSchema = internalMutation({
     // Clear tables that have schema changes
     const tablesToClear = [
       'priceSnapshots', // Old retention was wrong
-      'scores', // Old calculation was wrong
-      'baselines', // Will be recalculated
+      'scores_lite', // Materialized scores cache
     ];
 
     const results: Record<string, number> = {};
@@ -45,6 +44,7 @@ export const migrateToNewSchema = internalMutation({
         const docs = await queryGeneric(table).take(100);
 
         for (const doc of docs) {
+          // @ts-expect-error Dynamic table Id type; safe at runtime
           await ctx.db.delete(doc._id);
           deleted++;
         }
@@ -93,19 +93,19 @@ export const checkMigrationStatus = internalMutation({
     // Check for old data patterns
     const sampleSnapshot = await ctx.db.query('priceSnapshots').first();
 
-    const sampleScore = await ctx.db.query('scores').first();
+    await ctx.db.query('scores_lite').first();
 
-    const needsMigration =
-      (sampleSnapshot && !('volumeUsdSince' in sampleSnapshot)) ||
-      (sampleScore && !('totalVolumeUsd' in sampleScore));
+    const needsMigration = !!(
+      sampleSnapshot && !('volumeUsdSince' in sampleSnapshot)
+    );
 
     const oldDataCount = {
       snapshots: await ctx.db
         .query('priceSnapshots')
         .take(1000)
         .then((r) => r.length),
-      scores: await ctx.db
-        .query('scores')
+      scoresLite: await ctx.db
+        .query('scores_lite')
         .take(1000)
         .then((r) => r.length),
     };

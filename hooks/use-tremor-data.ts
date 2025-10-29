@@ -9,6 +9,7 @@ import {
   MarketSource,
 } from '@/lib/types';
 import { GeographicService } from '@/lib/geographic-service';
+import { useEffect, useState } from 'react';
 
 // Types matching getTopTremors result shape
 export type TopMarketMovement = {
@@ -135,7 +136,21 @@ export function mapTremorToMarketMovement(
   return movement;
 }
 
-export function useTremorData(window: '5m' | '60m' | '1440m' = '60m') {
+export type UseTremorDataReturn = {
+  markets: unknown; // from Convex query
+  movements: MarketMovement[];
+  suddenMoves: SuddenMove[];
+  loading: boolean;
+  connected: boolean;
+  lastUpdateTime: number;
+  isPaused: boolean;
+  togglePause: () => void;
+  refresh: () => void;
+};
+
+export function useTremorData(
+  window: '5m' | '60m' | '1440m' = '60m'
+): UseTremorDataReturn {
   // Get top tremors from Convex
   const topTremors = useQuery(api.scoring.getTopTremors, {
     window,
@@ -147,9 +162,19 @@ export function useTremorData(window: '5m' | '60m' | '1440m' = '60m') {
     limit: 100,
   });
 
+  // Track pause and last update time
+  const [isPaused, setIsPaused] = useState(false);
+  const [lastUpdateTime, setLastUpdateTime] = useState<number>(Date.now());
+  useEffect(() => {
+    if (topTremors) setLastUpdateTime(Date.now());
+  }, [topTremors]);
+
   // Convert to frontend format and enrich with geo once (service fallback)
-  const baseMovements: MarketMovement[] =
-    topTremors?.map(mapTremorToMarketMovement).filter(Boolean) || [];
+  const baseMovements: MarketMovement[] = (
+    (topTremors || []) as unknown as TremorScore[]
+  )
+    .map(mapTremorToMarketMovement)
+    .filter((m): m is MarketMovement => Boolean(m));
 
   const movements: MarketMovement[] = baseMovements.map((m) => {
     if (typeof m.lat === 'number' && typeof m.lng === 'number') return m;
@@ -166,7 +191,7 @@ export function useTremorData(window: '5m' | '60m' | '1440m' = '60m') {
   });
 
   // Filter for sudden moves (Seismo score > 7.5)
-  const suddenMoves: SuddenMove[] = displayedMovements
+  const suddenMoves: SuddenMove[] = movements
     .filter((m) => m.seismoScore && m.seismoScore > 7.5)
     .slice(0, 5)
     .map((m) => ({
@@ -177,30 +202,14 @@ export function useTremorData(window: '5m' | '60m' | '1440m' = '60m') {
 
   return {
     markets: activeMarkets || [],
-    movements: displayedMovements, // Return the controlled, stable data
+    movements,
     suddenMoves,
     loading: !topTremors && !activeMarkets,
     connected: true,
-    lastUpdateTime, // So UI can show "Last updated: X seconds ago"
+    lastUpdateTime,
     isPaused,
-    togglePause: () => {
-      setIsPaused((prev) => {
-        const newPaused = !prev;
-        if (!newPaused && processedDataRef.current.length > 0) {
-          // If unpausing, update immediately with latest data
-          setDisplayedMovements(processedDataRef.current);
-          setLastUpdateTime(Date.now());
-        }
-        return newPaused;
-      });
-    },
-    refresh: () => {
-      // Force immediate update
-      if (processedDataRef.current.length > 0) {
-        setDisplayedMovements(processedDataRef.current);
-        setLastUpdateTime(Date.now());
-      }
-    },
+    togglePause: () => setIsPaused((p: boolean) => !p),
+    refresh: () => setLastUpdateTime(Date.now()),
   };
 }
 

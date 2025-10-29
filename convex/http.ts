@@ -10,6 +10,7 @@ http.route({
   path: '/sync/markets',
   method: 'GET',
   handler: httpAction(async (ctx, _request) => {
+    void _request;
     try {
       // Fetch from Gamma API
       const response = await fetch(
@@ -71,7 +72,7 @@ http.route({
         JSON.stringify({
           success: true,
           ...result,
-          marketsFound: markets.length,
+          marketsFound: transformed.length,
         }),
         {
           status: 200,
@@ -184,14 +185,18 @@ http.route({
       // Update sync state
       if (transformed.length > 0) {
         const lastTrade = transformed[transformed.length - 1];
-        await ctx.runMutation(internal.markets.updateSyncState, { conditionId, lastTradeFetchMs: Date.now(), lastTradeId: lastTrade.txHash });
+        await ctx.runMutation(internal.markets.updateSyncState, {
+          conditionId,
+          lastTradeFetchMs: Date.now(),
+          lastTradeId: lastTrade.txHash,
+        });
       }
 
       return new Response(
         JSON.stringify({
           success: true,
           ...insertResult,
-          tradesFound: trades.length,
+          tradesFound: transformed.length,
         }),
         {
           status: 200,
