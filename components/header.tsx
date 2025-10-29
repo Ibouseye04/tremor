@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState, memo } from 'react';
+import Link from 'next/link';
 import { OnboardingModal } from './onboarding-modal';
 
 export const Header = memo(function Header() {
@@ -101,6 +102,15 @@ export const Header = memo(function Header() {
             <span className="relative z-10">How</span>
             <div className="absolute inset-0 -translate-x-full bg-gradient-to-r from-tremor-high/20 to-tremor-extreme/20 transition-transform group-hover:translate-x-0" />
           </button>
+
+          <Link
+            href="/map"
+            className="group relative overflow-hidden rounded border border-zinc-800 px-3 py-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-400 transition-all hover:border-tremor-pulse/50 hover:text-white"
+          >
+            <span className="relative z-10">Map</span>
+            <div className="absolute inset-0 -translate-x-full bg-gradient-to-r from-tremor-pulse/20 to-tremor-pulse/10 transition-transform group-hover:translate-x-0" />
+          </Link>
+
           {isLive && (
             <span className="flex items-center gap-1 rounded border border-tremor-pulse/50 bg-tremor-pulse/10 px-2 py-0.5">
               <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-tremor-pulse"></span>

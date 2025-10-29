@@ -8,21 +8,138 @@ import {
   MarketCategory,
   MarketSource,
 } from '@/lib/types';
-import { useEffect, useRef, useState, useMemo } from 'react';
+import { GeographicService } from '@/lib/geographic-service';
+
+// Types matching getTopTremors result shape
+export type TopMarketMovement = {
+  conditionId: string;
+  question: string;
+  prevPrice: number;
+  currPrice: number;
+  change: number; // signed pp change
+  volume: number;
+};
+export type TremorEventDoc = {
+  title?: string;
+  category?: string;
+  slug?: string;
+  image?: string;
+  volume?: number;
+};
+export type TremorTopMarketDoc = {
+  lastTradePrice?: number;
+  question?: string;
+};
+export type TremorGeo = {
+  lat: number;
+  lng: number;
+  country?: string;
+  region?: string;
+  confidence: 'high' | 'medium' | 'low';
+};
+export interface TremorScore {
+  eventId: string;
+  timestampMs: number;
+  seismoScore: number;
+  topMarketChange?: number;
+  topMarketPrevPrice01?: number;
+  topMarketCurrPrice01?: number;
+  topMarketQuestion?: string;
+  marketMovements?: TopMarketMovement[];
+  totalVolume?: number;
+  event?: TremorEventDoc;
+  topMarket?: TremorTopMarketDoc;
+  geo?: TremorGeo;
+}
+
+export function mapTremorToMarketMovement(
+  tremor: TremorScore
+): MarketMovement | null {
+  // Prefer bucket-derived prices from score, fallback to market lastTradePrice
+  const curr =
+    tremor.topMarketCurrPrice01 ?? tremor.topMarket?.lastTradePrice ?? 0;
+  const prev =
+    tremor.topMarketPrevPrice01 ||
+    curr / (1 + (tremor.topMarketChange || 0) / 100);
+  const currentPrice = curr;
+  const previousPrice = prev;
+  const priceChangePercent = tremor.topMarketChange || 0;
+
+  if (currentPrice <= 0) return null;
+
+  // Calculate multi-market stats
+  const marketMoves: TopMarketMovement[] = tremor.marketMovements || [];
+  const activeMarkets = marketMoves.filter((m) => Math.abs(m.change) > 0.1);
+  const marketsUp = marketMoves.filter((m) => m.change > 0).length;
+  const marketsDown = marketMoves.filter((m) => m.change < 0).length;
+  const avgChange =
+    marketMoves.length > 0
+      ? marketMoves.reduce(
+          (sum: number, m: TopMarketMovement) => sum + Math.abs(m.change),
+          0
+        ) / marketMoves.length
+      : 0;
+  const correlatedMovement =
+    (marketsUp > 0 && marketsDown === 0) ||
+    (marketsDown > 0 && marketsUp === 0);
+
+  const movement: MarketMovement = {
+    id: tremor.eventId,
+    eventId: tremor.eventId, // Include for AI analysis
+    title: tremor.event?.title || 'Unknown Event',
+    category: categorizeMarket(
+      tremor.event?.category ||
+        tremor.event?.title ||
+        tremor.topMarketQuestion ||
+        ''
+    ) as MarketCategory,
+    source: 'Polymarket' as MarketSource,
+    previousValue: Math.round(previousPrice * 100),
+    currentValue: Math.round(currentPrice * 100),
+    change: priceChangePercent,
+    timestamp: new Date(tremor.timestampMs),
+    totalVolume: tremor.totalVolume || tremor.event?.volume || 0,
+    url: tremor.event?.slug
+      ? `https://polymarket.com/event/${tremor.event.slug}`
+      : '#',
+    image: tremor.event?.image,
+    seismoScore: tremor.seismoScore,
+    marketMovements: marketMoves,
+    multiMarketStats:
+      marketMoves.length > 1
+        ? {
+            totalMarkets: marketMoves.length,
+            activeMarkets: activeMarkets.length,
+            marketsUp,
+            marketsDown,
+            averageChange: avgChange,
+            correlatedMovement,
+          }
+        : undefined,
+  };
+
+  // Attach server-provided geo if present
+  if (
+    tremor.geo &&
+    typeof tremor.geo.lat === 'number' &&
+    typeof tremor.geo.lng === 'number'
+  ) {
+    movement.lat = tremor.geo.lat;
+    movement.lng = tremor.geo.lng;
+    movement.country = tremor.geo.country;
+    movement.region = tremor.geo.region;
+    movement.geoConfidence =
+      (tremor.geo.confidence as 'high' | 'medium' | 'low') || 'high';
+  }
+
+  return movement;
+}
 
 export function useTremorData(window: '5m' | '60m' | '1440m' = '60m') {
-  // State for controlled updates
-  const [displayedMovements, setDisplayedMovements] = useState<
-    MarketMovement[]
-  >([]);
-  const [lastUpdateTime, setLastUpdateTime] = useState(Date.now());
-  const [isPaused, setIsPaused] = useState(false);
-  const processedDataRef = useRef<MarketMovement[]>([]);
-
-  // Get top tremors from Convex (still reactive, but we control when to show)
+  // Get top tremors from Convex
   const topTremors = useQuery(api.scoring.getTopTremors, {
     window,
-    limit: 100, // Increase limit to get more data
+    limit: 50,
   });
 
   // Get active markets
@@ -30,177 +147,23 @@ export function useTremorData(window: '5m' | '60m' | '1440m' = '60m') {
     limit: 100,
   });
 
-  // Process and sort the raw data with stable sorting
-  const processedMovements = useMemo(() => {
-    if (!topTremors) return [];
+  // Convert to frontend format and enrich with geo once (service fallback)
+  const baseMovements: MarketMovement[] =
+    topTremors?.map(mapTremorToMarketMovement).filter(Boolean) || [];
 
-    console.log(
-      `[useTremorData] Processing ${topTremors.length} tremors for window: ${window}`
-    );
-
-    const movements = topTremors
-      .map((tremor) => {
-        // Prefer bucket-derived prices from score, fallback to market lastTradePrice
-        const curr =
-          tremor.topMarketCurrPrice01 ?? tremor.topMarket?.lastTradePrice ?? 0;
-        // CRITICAL FIX: The backend sends PERCENTAGE POINT change, not percentage change!
-        // If price goes from 90% to 100%, that's +10 percentage points (not +11.11% change)
-        // So previous = current - change_in_points
-        const prev =
-          tremor.topMarketPrevPrice01 ??
-          (tremor.topMarketChange !== undefined
-            ? curr - tremor.topMarketChange / 100 // Convert percentage points to decimal
-            : curr);
-        const currentPrice = curr;
-        const previousPrice = prev;
-        const priceChangePercent = tremor.topMarketChange || 0;
-
-        // Calculate multi-market stats
-        const marketMoves = tremor.marketMovements || [];
-        const activeMarkets = marketMoves.filter(
-          (m: any) => Math.abs(m.change) > 0.1
-        );
-        const marketsUp = marketMoves.filter((m: any) => m.change > 0).length;
-        const marketsDown = marketMoves.filter((m: any) => m.change < 0).length;
-        const avgChange =
-          marketMoves.length > 0
-            ? marketMoves.reduce((sum: number, m: any) => sum + Math.abs(m.change), 0) /
-              marketMoves.length
-            : 0;
-        const correlatedMovement =
-          (marketsUp > 0 && marketsDown === 0) ||
-          (marketsDown > 0 && marketsUp === 0);
-
-        return {
-          id: tremor.eventId,
-          eventId: tremor.eventId, // Include for AI analysis
-          title: tremor.event?.title || 'Unknown Event',
-          category: categorizeMarket(
-            tremor.event?.category ||
-              tremor.event?.title ||
-              tremor.topMarketQuestion ||
-              ''
-          ) as MarketCategory,
-          source: 'Polymarket' as MarketSource,
-          previousValue: Math.round(previousPrice * 100),
-          currentValue: Math.round(currentPrice * 100),
-          change: priceChangePercent,
-          timestamp: new Date(tremor.timestampMs),
-          totalVolume: tremor.totalVolume || tremor.event?.volume || 0,
-          url: tremor.event?.slug
-            ? `https://polymarket.com/event/${tremor.event.slug}`
-            : '#',
-          image: tremor.event?.image,
-          seismoScore: tremor.seismoScore,
-          marketMovements: marketMoves,
-          multiMarketStats:
-            marketMoves.length > 1
-              ? {
-                  totalMarkets: marketMoves.length,
-                  activeMarkets: activeMarkets.length,
-                  marketsUp,
-                  marketsDown,
-                  averageChange: avgChange,
-                  correlatedMovement,
-                }
-              : undefined,
-        };
-      })
-      // CRITICAL FIX: Allow markets at 0%, only filter null/undefined
-      .filter((m) => m.currentValue !== null && m.currentValue !== undefined)
-      // Filter out zero intensity scores - no point showing markets with no movement
-      .filter((m) => {
-        const pass = m.seismoScore && m.seismoScore > 0;
-        if (!pass) {
-          console.log(
-            `[useTremorData] Filtering out ${m.title} with score ${m.seismoScore}`
-          );
-        }
-        return pass;
-      })
-      // Stable sorting: Sort by seismoScore DESC, then by eventId for stability
-      .sort((a, b) => {
-        // Primary sort by seismoScore (descending)
-        const scoreDiff = (b.seismoScore || 0) - (a.seismoScore || 0);
-        if (scoreDiff !== 0) return scoreDiff;
-
-        // Secondary sort by absolute change (descending)
-        const changeDiff = Math.abs(b.change || 0) - Math.abs(a.change || 0);
-        if (changeDiff !== 0) return changeDiff;
-
-        // Tertiary sort by volume for more dynamic ordering
-        const volumeDiff = (b.totalVolume || 0) - (a.totalVolume || 0);
-        if (volumeDiff !== 0) return volumeDiff;
-
-        // Quaternary sort by eventId for final stability
-        return a.eventId.localeCompare(b.eventId);
-      });
-
-    console.log(
-      `[useTremorData] After filtering: ${movements.length} movements for window ${window}`
-    );
-    return movements;
-  }, [topTremors, window]); // Depend on both topTremors and window
-
-  // Store latest processed data in ref
-  useEffect(() => {
-    processedDataRef.current = processedMovements;
-  }, [processedMovements]);
-
-  // Update display when data changes (if not paused)
-  useEffect(() => {
-    if (!isPaused && processedMovements.length > 0) {
-      // Reduce debounce to 500ms for more responsive updates
-      const timeoutId = setTimeout(() => {
-        console.log(
-          'Data changed, updating display...',
-          new Date().toLocaleTimeString()
-        );
-        setDisplayedMovements(processedMovements);
-        setLastUpdateTime(Date.now());
-      }, 500); // Reduced debounce for more responsive updates
-
-      return () => clearTimeout(timeoutId);
-    }
-  }, [processedMovements, isPaused]); // Simplified dependencies
-
-  // Initial load - show data immediately when available
-  useEffect(() => {
-    if (displayedMovements.length === 0 && processedMovements.length > 0) {
-      console.log('Initial data load:', processedMovements.length, 'items');
-      setDisplayedMovements(processedMovements);
-      setLastUpdateTime(Date.now());
-    }
-  }, [processedMovements.length]); // Run when data becomes available
-
-  // When window changes, update immediately with new data
-  useEffect(() => {
-    console.log(
-      'Window changed to:',
-      window,
-      'New data:',
-      processedMovements.length,
-      'items'
-    );
-    // ALWAYS update when window changes, even if empty (to show "no data" state)
-    setDisplayedMovements(processedMovements);
-    setLastUpdateTime(Date.now());
-  }, [window, processedMovements]); // Trigger on window change AND new data
-
-  // Add real 30-second refresh timer (matches backend scoring interval)
-  useEffect(() => {
-    if (!isPaused) {
-      const interval = setInterval(() => {
-        console.log('30s refresh tick', new Date().toLocaleTimeString());
-        if (processedDataRef.current.length > 0) {
-          setDisplayedMovements(processedDataRef.current);
-          setLastUpdateTime(Date.now());
-        }
-      }, 30000); // 30 seconds to match backend scoring
-
-      return () => clearInterval(interval);
-    }
-  }, [isPaused]); // Only depend on pause state
+  const movements: MarketMovement[] = baseMovements.map((m) => {
+    if (typeof m.lat === 'number' && typeof m.lng === 'number') return m;
+    const geo = GeographicService.mapMovementToGeo(m);
+    if (!geo) return m;
+    return {
+      ...m,
+      lat: geo.lat,
+      lng: geo.lng,
+      region: geo.region,
+      country: geo.country,
+      geoConfidence: geo.confidence,
+    };
+  });
 
   // Filter for sudden moves (Seismo score > 7.5)
   const suddenMoves: SuddenMove[] = displayedMovements

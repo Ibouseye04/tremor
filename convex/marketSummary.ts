@@ -31,7 +31,7 @@ export const getSummary = query({
 });
 
 // Internal action to generate market summary
-export const generateSummary: any = internalAction({
+export const generateSummary = internalAction({
   args: {},
   handler: async (ctx) => {
     const apiKey = process.env.XAI_API_KEY;
@@ -54,10 +54,17 @@ export const generateSummary: any = internalAction({
       }
 
       // Prepare context for summary
-      const movementsContext = recentMovements
+      const items = recentMovements as Array<{
+        title: string;
+        previousValue: number;
+        currentValue: number;
+        seismoScore?: number;
+        category?: string;
+      }>;
+      const movementsContext = items
         .slice(0, 10) // Top 10 movements
         .map(
-          (m: any) =>
+          (m) =>
             `- ${m.title}: ${m.previousValue}% → ${m.currentValue}% (${m.seismoScore?.toFixed(1)} intensity)`
         )
         .join('\n');
@@ -108,10 +115,7 @@ Summary:`;
 
       if (!summary || summary.trim() === '') {
         logger.error('Empty summary content');
-        logger.error(
-          'Full response structure:',
-          JSON.stringify(data, null, 2)
-        );
+        logger.error('Full response structure:', JSON.stringify(data, null, 2));
         // Use a fallback summary instead of throwing
         return {
           success: true,
@@ -119,13 +123,11 @@ Summary:`;
             summary:
               'Market activity is showing mixed signals across political and economic sectors. Traders are closely monitoring upcoming elections and policy decisions.',
             totalMovements: recentMovements.length,
-            extremeMovements: recentMovements.filter(
-              (m: any) => m.seismoScore && m.seismoScore >= 7.5
+            extremeMovements: items.filter(
+              (m) => m.seismoScore && m.seismoScore >= 7.5
             ).length,
             topCategories: [
-              ...new Set(
-                recentMovements.map((m: any) => m.category).filter(Boolean)
-              ),
+              ...new Set(items.map((m) => m.category).filter(Boolean)),
             ].slice(0, 3),
             generatedAt: Date.now(),
           },
@@ -133,12 +135,12 @@ Summary:`;
       }
 
       // Calculate some stats
-      const totalMovements = recentMovements.length;
-      const extremeMovements = recentMovements.filter(
-        (m: any) => m.seismoScore && m.seismoScore >= 7.5
+      const totalMovements = items.length;
+      const extremeMovements = items.filter(
+        (m) => m.seismoScore && m.seismoScore >= 7.5
       ).length;
       const categories = [
-        ...new Set(recentMovements.map((m: any) => m.category).filter(Boolean)),
+        ...new Set(items.map((m) => m.category).filter(Boolean)),
       ];
 
       // Store the summary
@@ -186,18 +188,21 @@ export const storeSummary = mutation({
 });
 
 // Internal action for cron job - generates summary unconditionally
-export const generateSummaryCron: any = internalAction({
+export const generateSummaryCron = internalAction({
   args: {},
   handler: async (ctx) => {
     logger.info('[Cron] Generating market summary...');
-    const result = await ctx.runAction((internal as any).marketSummary.generateSummary);
-    logger.info('[Cron] Market summary generation result:', result.success ? 'success' : 'failed');
+    const result = await ctx.runAction(internal.marketSummary.generateSummary);
+    logger.info(
+      '[Cron] Market summary generation result:',
+      result.success ? 'success' : 'failed'
+    );
     return result;
   },
 });
 
 // Action to refresh summary if needed (kept for backward compatibility)
-export const refreshIfNeeded: any = action({
+export const refreshIfNeeded = action({
   args: {},
   handler: async (ctx) => {
     const current = await ctx.runQuery(api.marketSummary.getSummary);
@@ -205,9 +210,9 @@ export const refreshIfNeeded: any = action({
     // Generate if no summary exists or if it's stale (> 30 minutes old)
     const THIRTY_MINUTES = 30 * 60 * 1000;
     const now = Date.now();
-    
-    if (!current || (now - current.generatedAt > THIRTY_MINUTES)) {
-      return await ctx.runAction((api.marketSummary as any).generateSummary);
+
+    if (!current || now - current.generatedAt > THIRTY_MINUTES) {
+      return await ctx.runAction(internal.marketSummary.generateSummary);
     }
 
     return { success: true, cached: true, summary: current };

@@ -4,7 +4,7 @@ import { api, internal } from './_generated/api';
 import { logger } from '../lib/logger';
 
 // Public action to request AI analysis (called when user clicks Intelligence button)
-export const requestAnalysis: any = action({
+export const requestAnalysis = action({
   args: {
     movementId: v.string(),
     eventId: v.string(),
@@ -39,7 +39,10 @@ export const requestAnalysis: any = action({
     }
 
     // Generate new analysis using the internal action
-    const result = await ctx.runAction((internal.aiActions as any).generateAnalysis, args);
+    const result = await ctx.runAction(
+      internal.aiActions.generateAnalysis,
+      args
+    );
 
     return result;
   },

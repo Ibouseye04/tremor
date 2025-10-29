@@ -1,44 +1,43 @@
-import { internalAction } from "./_generated/server";
-import { internal, api } from "./_generated/api";
-// Logger removed - not available in Convex runtime
+import { internalAction } from './_generated/server';
+import { internal, api } from './_generated/api';
+import { logger } from '../lib/logger';
 
-// Polymarket API types
-interface PolymarketMarket {
-  id: string;
-  question: string;
-  conditionId: string;
-  volume24hr: number;
-  active: boolean;
-  closed: boolean;
-  lastTradePrice: number;
-  bestBid?: number;
-  bestAsk?: number;
-}
+type GammaMarket = {
+  conditionId?: string;
+  question?: string;
+  active?: boolean;
+  closed?: boolean;
+  lastTradePrice?: string | number | null;
+  bestBid?: string | number | null;
+  bestAsk?: string | number | null;
+  volume24hr?: string | number | null;
+};
 
-interface PolymarketEvent {
-  id: string;
-  slug: string;
-  title: string;
+type GammaEvent = {
+  id?: string;
+  slug?: string;
+  title?: string;
+  question?: string;
   description?: string;
   category?: string;
   image?: string;
   icon?: string;
-  active: boolean;
-  closed: boolean;
-  liquidity: number;
-  volume: number;
-  markets: PolymarketMarket[];
-}
+  active?: boolean;
+  closed?: boolean;
+  liquidity?: string | number | null;
+  volume?: string | number | null;
+  markets?: GammaMarket[];
+};
 
-interface PolymarketTrade {
-  price: number;
-  size: number;
+type DataTrade = {
+  price?: string | number | null;
+  size?: string | number | null;
   timestamp: number;
-  outcome?: string;
-  side?: string;
+  side?: string | null;
   transactionHash?: string;
+  outcome?: string;
   filler?: { outcome?: string };
-}
+};
 
 // Sync events and their markets from Gamma API
 export const syncEvents = internalAction({
@@ -61,8 +60,20 @@ export const syncEvents = internalAction({
         const url = `https://gamma-api.polymarket.com/events/pagination?limit=${limit}&offset=${offset}&active=true&closed=false`;
         const response = await fetch(url, {
           headers: {
-            'Accept': 'application/json',
+            Accept: 'application/json',
           },
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(`Gamma API error: ${response.status}`);
+      }
+
+      const raw = (await response.json()) as unknown;
+      const events: GammaEvent[] = Array.isArray(raw)
+        ? (raw as GammaEvent[])
+        : [];
+
         });
 
         if (!response.ok) {
@@ -87,45 +98,64 @@ export const syncEvents = internalAction({
 
       let totalEvents = 0;
       let totalMarkets = 0;
+
+      for (const event of events) {
+        // Skip events without markets or volume
       let filteredEvents = 0;
 
       for (const event of allEvents) {
         // Skip events without markets
         if (!event.markets || event.markets.length === 0) continue;
 
+
         // Calculate total volume for the event
-        const eventVolume24hr = event.markets.reduce((sum: number, m: PolymarketMarket) =>
-          sum + Number(m.volume24hr ?? 0), 0
+        const eventVolume = (event.markets as GammaMarket[]).reduce(
+          (sum: number, m: GammaMarket) =>
+            sum + parseFloat(String(m.volume24hr ?? '0')),
+          0
         );
 
+        // Skip events with no volume
+        if (eventVolume === 0) continue;
 
-        const totalVolume = Number((event as any).volume ?? 0);
-        const liquidity = Number((event as any).liquidity ?? 0);
-
-        // Apply minimum thresholds to filter out micro-events
-        if (eventVolume24hr < MIN_DAILY_VOLUME ||
-            totalVolume < MIN_TOTAL_VOLUME ||
-            liquidity < MIN_LIQUIDITY) {
-          filteredEvents++;
-          continue;
-        }
-
-        // HIGH PRIORITY FIX: Better atomicity - prepare data first, then store together
-        const validMarkets = event.markets
-          .filter((m: PolymarketMarket) => m.conditionId && m.conditionId.length > 10)
-          .map((m: PolymarketMarket) => ({
-            conditionId: m.conditionId,
+        // Store event
+        await ctx.runMutation(internal.events.upsertEvent, {
+          event: {
             eventId: event.id || event.slug,
-            question: m.question || "Unknown",
+            slug: event.slug,
+            title: event.title || event.question || 'Unknown Event',
+            description: event.description,
+            category: event.category,
+            image: event.image || event.icon, // Add image from API
+            active: event.active !== false,
+            closed: event.closed === true,
+            liquidity: parseFloat(event.liquidity || '0'),
+            volume: parseFloat(event.volume || '0'),
+            volume24hr: eventVolume,
+          },
+        });
+        totalEvents++;
+
+        // Store markets within this event
+        const validMarkets = (event.markets as GammaMarket[])
+          .filter(
+            (m) => !!m.conditionId && (m.conditionId as string).length > 10
+          )
+          .map((m) => ({
+            conditionId: m.conditionId as string,
+            eventId: event.id || event.slug || '',
+            question: m.question || 'Unknown',
             active: m.active !== false,
             closed: m.closed === true,
-            lastTradePrice: Number(m.lastTradePrice ?? 0),
-            bestBid: typeof m.bestBid === 'number' ? m.bestBid : undefined,
-            bestAsk: typeof m.bestAsk === 'number' ? m.bestAsk : undefined,
-            volume24hr: Number(m.volume24hr ?? 0),
+            lastTradePrice: parseFloat(String(m.lastTradePrice ?? '0')),
+            bestBid:
+              m.bestBid != null ? parseFloat(String(m.bestBid)) : undefined,
+            bestAsk:
+              m.bestAsk != null ? parseFloat(String(m.bestAsk)) : undefined,
+            volume24hr: parseFloat(String(m.volume24hr ?? '0')),
           }));
 
-        // Only store event if it has valid markets
+// Only store event if it has valid markets
         if (validMarkets.length > 0) {
           try {
             // Store event first
@@ -158,9 +188,11 @@ export const syncEvents = internalAction({
         }
       }
 
+      logger.info(`Synced ${totalEvents} events with ${totalMarkets} markets`);
+
       console.log(`Synced ${totalEvents} events with ${totalMarkets} markets (filtered ${filteredEvents} low-volume events)`);
     } catch (error) {
-      console.error("Event sync error:", error);
+      console.error('Event sync error:', error);
     }
   },
 });
@@ -171,12 +203,94 @@ export const syncHotTrades = internalAction({
   handler: async (ctx) => {
     try {
       const markets = await ctx.runQuery(api.markets.getMarketsToSync, {
-        priority: "hot",
+        priority: 'hot',
         limit: 3,
       });
-      
+
       for (const market of markets) {
         if (!market.market) continue;
+
+        // Fetch trades - get last 25 hours for 24h scoring window
+        // Plus 1 hour buffer to ensure we have baseline price
+        const since = Math.floor((Date.now() - 25 * 60 * 60 * 1000) / 1000); // 25 hours ago
+
+        const params = new URLSearchParams({
+          market: market.conditionId,
+          limit: '500',
+          after: since.toString(),
+        });
+
+        const response = await fetch(
+          `https://data-api.polymarket.com/trades?${params}`,
+          {
+            headers: {
+              Accept: 'application/json',
+            },
+          }
+        );
+
+        if (response.ok) {
+          const rawTrades = (await response.json()) as unknown;
+          const trades: DataTrade[] = Array.isArray(rawTrades)
+            ? (rawTrades as DataTrade[])
+            : [];
+
+          if (trades.length > 0) {
+            // Transform and validate trades
+            const transformed = trades
+              .filter(
+                (t) =>
+                  t.price != null &&
+                  t.size != null &&
+                  typeof t.timestamp === 'number'
+              ) // Validate required fields
+              .map((t) => {
+                // CRITICAL FIX: Normalize all prices to YES outcome
+                // Polymarket returns price for the outcome being traded
+                // For NO trades: YES price = 1 - NO price
+                const rawPrice = parseFloat(String(t.price ?? '0'));
+                const outcome = (
+                  t.outcome ||
+                  t.filler?.outcome ||
+                  'Yes'
+                ).toLowerCase();
+                const normalizedPrice =
+                  outcome === 'no' ? 1 - rawPrice : rawPrice;
+
+                return {
+                  conditionId: market.conditionId,
+                  eventId: market.market?.eventId || market.conditionId, // Add eventId
+                  timestampMs:
+                    t.timestamp < 10000000000
+                      ? t.timestamp * 1000
+                      : t.timestamp, // Handle both seconds and ms
+                  price01: normalizedPrice,
+                  size: parseFloat(String(t.size ?? '0')),
+                  side: t.side || 'unknown',
+                  txHash:
+                    t.transactionHash ||
+                    `${market.conditionId}_${t.timestamp}_${t.price}_${t.size}`,
+                };
+              });
+
+            // Store trades (now directly aggregates into buckets)
+            const insertResult = await ctx.runMutation(
+              internal.trades.insertTrades,
+              {
+                trades: transformed,
+              }
+            );
+
+            // Update sync state
+            await ctx.runMutation(internal.markets.updateSyncState, {
+              conditionId: market.conditionId,
+              lastTradeFetchMs: Date.now(),
+            });
+
+            logger.debug(
+              `Processed ${transformed.length} trades → ${insertResult.inserted} snapshots for ${market.market.question}`
+            );
+          }
 
         const limit = 1000;
         let offset = 0;
@@ -274,7 +388,7 @@ export const syncHotTrades = internalAction({
         }
       }
     } catch (error) {
-      console.error("Hot trade sync error:", error);
+      console.error('Hot trade sync error:', error);
     }
   },
 });
@@ -286,10 +400,10 @@ export const syncWarmTrades = internalAction({
     try {
       // Get warm markets to sync
       const markets = await ctx.runQuery(api.markets.getMarketsToSync, {
-        priority: "warm",
+        priority: 'warm',
         limit: 10,
       });
-      
+
       for (const market of markets) {
         if (!market.market) continue;
 
@@ -379,8 +493,71 @@ export const syncWarmTrades = internalAction({
         }
       }
     } catch (error) {
-      console.error("Warm trade sync error:", error);
+      logger.error('Warm trade sync error:', error);
     }
   },
 });
 
+// Compute scores for all active events
+export const computeAllScores = internalAction({
+  args: {},
+  handler: async (ctx) => {
+    try {
+      // Get active events
+      const events = await ctx.runQuery(api.events.getActiveEvents, {
+        limit: 100,
+      });
+
+      for (const event of events) {
+        // Compute 5m, 60m, and 1d scores
+        for (const windowMinutes of [5, 60, 1440]) {
+          try {
+            await ctx.runMutation(internal.scoring.computeEventScore, {
+              eventId: event.eventId,
+              windowMinutes,
+            });
+          } catch (error) {
+            logger.error(
+              `Score computation failed for event ${event.eventId}:`,
+              error
+            );
+          }
+        }
+      }
+
+      logger.info(`Computed scores for ${events.length} events`);
+    } catch (error) {
+      logger.error('Score computation error:', error);
+    }
+  },
+});
+
+// Compute baselines for all markets
+export const computeAllBaselines = internalAction({
+  args: {},
+  handler: async (ctx) => {
+    try {
+      const markets = await ctx.runQuery(api.markets.getActiveMarkets, {
+        limit: 500,
+      });
+
+      for (const market of markets) {
+        try {
+          await ctx.runMutation(internal.scoring.computeBaselines, {
+            conditionId: market.conditionId,
+            lookbackDays: 14,
+          });
+        } catch (error) {
+          logger.error(
+            `Baseline computation failed for ${market.conditionId}:`,
+            error
+          );
+        }
+      }
+
+      logger.info(`Computed baselines for ${markets.length} markets`);
+    } catch (error) {
+      logger.error('Baseline computation error:', error);
+    }
+  },
+});
