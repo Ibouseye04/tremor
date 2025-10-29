@@ -121,4 +121,16 @@ export default defineSchema({
     topCategories: v.array(v.string()), // Most active categories
     generatedAt: v.number(), // When generated (for cache)
   }),
+
+  // Geographic cache for events (optional, future use)
+  eventGeo: defineTable({
+    eventId: v.string(),
+    lat: v.float64(),
+    lng: v.float64(),
+    region: v.optional(v.string()),
+    country: v.optional(v.string()),
+    geoConfidence: v.string(), // 'high' | 'medium' | 'low'
+    derivedFrom: v.optional(v.string()), // 'title' | 'question' | 'inferred'
+    updatedAt: v.number(),
+  }).index('by_event', ['eventId']),
 });

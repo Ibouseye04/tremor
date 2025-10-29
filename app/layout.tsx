@@ -3,6 +3,7 @@ import { JetBrains_Mono, Inter } from 'next/font/google';
 import { Analytics } from '@vercel/analytics/next';
 import { Providers } from './providers';
 import './globals.css';
+import 'leaflet/dist/leaflet.css';
 
 const jetbrainsMono = JetBrains_Mono({
   variable: '--font-mono',

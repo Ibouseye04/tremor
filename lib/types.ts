@@ -24,6 +24,12 @@ export interface MarketMovement {
   url?: string;
   image?: string; // Event image URL
   seismoScore?: number; // 0-10 normalized score
+  // Optional server-provided geographic enrichment
+  lat?: number;
+  lng?: number;
+  country?: string;
+  region?: string;
+  geoConfidence?: 'high' | 'medium' | 'low';
   // Individual market movements within this event
   marketMovements?: Array<{
     conditionId: string;

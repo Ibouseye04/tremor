@@ -1,7 +1,8 @@
-import type { NextConfig } from "next";
+import type { NextConfig } from 'next';
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  // Disable React Strict Mode to prevent double-mount in dev, which conflicts with Leaflet initialization
+  reactStrictMode: false,
 };
 
 export default nextConfig;
